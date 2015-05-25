@@ -198,4 +198,5 @@ define( [ 'enketo-js/Widget', 'Modernizr', 'jquery', 'enketo-widget/date/bootstr
             } );
         };
 
+        return pluginName;
     } );

@@ -28,8 +28,7 @@ module.exports = function( grunt ) {
         connect: {
             server: {
                 options: {
-                    port: 8080,
-                    hostname: '*'
+                    port: 8080
                 }
             },
             test: {
@@ -77,79 +76,34 @@ module.exports = function( grunt ) {
                 }
             }
         },
-        jasmine: {
-            test: {
-                src: 'src/js/**/*.js',
-                options: {
-                    keepRunner: true,
-                    specs: 'test/spec/*.js',
-                    helpers: [ 'test/util/*.js', 'test/mock/*.js' ],
-                    host: 'http://127.0.0.1:8000/',
-                    template: require( 'grunt-template-jasmine-requirejs' ),
-                    templateOptions: {
-                        requireConfig: {
-                            baseUrl: 'lib',
-                            paths: {
-                                'enketo-js': '../src/js',
-                                'enketo-widget': '../src/widget',
-                                'enketo-config': '../config.json',
-                                text: 'text/text',
-                                xpath: 'xpath/build/xpathjs_javarosa',
-                                jquery: 'bower-components/jquery/dist/jquery',
-                                'jquery.xpath': 'jquery-xpath/jquery.xpath',
-                                'jquery.touchswipe': 'jquery-touchswipe/jquery.touchSwipe',
-                                'leaflet': 'leaflet/leaflet',
-                                'bootstrap-slider': 'bootstrap-slider/js/bootstrap-slider',
-                                'q': 'bower-components/q/q'
-                            },
-                            shim: {
-                                'xpath': {
-                                    exports: 'XPathJS'
-                                },
-                                'bootstrap': {
-                                    deps: [ 'jquery' ],
-                                    exports: 'jQuery.fn.bootstrap'
-                                },
-                                'widget/date/bootstrap3-datepicker/js/bootstrap-datepicker': {
-                                    deps: [ 'jquery' ],
-                                    exports: 'jQuery.fn.datepicker'
-                                },
-                                'widget/time/bootstrap3-timepicker/js/bootstrap-timepicker': {
-                                    deps: [ 'jquery' ],
-                                    exports: 'jQuery.fn.timepicker'
-                                },
-                                'leaflet': {
-                                    exports: 'L'
-                                }
-                            },
-                            map: {
-                                '*': {
-                                    'enketo-js': '../src/js',
-                                    'enketo-widget': '../src/widget'
-                                }
-                            }
-                        }
-                    }
-                },
+        karma: {
+            options: {
+                singleRun: true,
+                reporters: [ 'dots' ]
+            },
+            headless: {
+                configFile: 'test/karma.conf.js',
+                browsers: [ 'PhantomJS' ]
+            },
+            browsers: {
+                configFile: 'test/karma.conf.js',
+                browsers: [ 'Chrome', 'ChromeCanary', /*'Firefox'*/ /*, 'Opera',*/ 'Safari' ]
             }
         },
         prepWidgetSass: {
-            writePath: 'src/sass/_widgets.scss',
+            writePath: 'src/sass/core/_widgets.scss',
             widgetConfigPath: 'config.json'
         },
         sass: {
-            dist: {
-                options: {
-                    style: 'expanded',
-                    noCache: true
-                },
-                files: [ {
-                    expand: true,
-                    cwd: 'src/sass',
-                    src: [ '**/*.scss', '!**/_*.scss' ],
-                    dest: 'build/css',
-                    ext: '.css'
-                } ]
+            compile: {
+                cwd: 'src/sass',
+                dest: 'build/css',
+                expand: true,
+                outputStyle: 'expanded',
+                src: '**/*.scss',
+                ext: '.css',
+                flatten: true,
+                extDot: 'last'
             }
         },
         // this compiles all javascript to a single minified file
@@ -157,8 +111,8 @@ module.exports = function( grunt ) {
             compile: {
                 options: {
                     name: '../app',
-                    baseUrl: 'lib',
-                    mainConfigFile: "app.js",
+                    baseUrl: './lib',
+                    mainConfigFile: 'require-config.js',
                     findNestedDependencies: true,
                     include: ( function() {
                         //add widgets js and widget config.json files
@@ -168,23 +122,9 @@ module.exports = function( grunt ) {
                         } );
                         return [ './bower-components/requirejs/require.js' ].concat( widgets );
                     } )(),
-                    exclude: ["jquery"],
-                    out: "build/js/app.js",
-                    optimize: "none"
+                    out: "build/js/combined.min.js",
+                    optimize: "uglify2"
                 }
-            }
-        },
-        copy: {
-            main: {
-                files: [
-                    {expand: true, flatten: true, src: ['build/js/app.js'], dest: '../datawinners/media/javascript/', filter: 'isFile'},
-                    {expand: true, flatten: true, src: ['build/css/'], dest: '../datawinners/media/css/scss/enketo_css/', filter: 'isFile'},
-                    {expand: true, flatten: true, src: ['build/css/*'], dest: '../datawinners/media/css/scss/enketo_css/', filter: 'isFile'},
-
-                    {expand: true, flatten: true, src: ['build/fonts/'], dest: '../datawinners/media/css/font/', filter: 'isFile'},
-                    {expand: true, flatten: true, src: ['build/fonts/*'], dest: '../datawinners/media/css/font/', filter: 'isFile'}
-
-                ]
             }
         },
         modernizr: {
@@ -204,7 +144,6 @@ module.exports = function( grunt ) {
         }
     } );
 
-    grunt.loadNpmTasks('grunt-contrib-copy');
     //maybe this can be turned into a npm module?
     grunt.registerTask( 'prepWidgetSass', 'Preparing _widgets.scss dynamically', function() {
         var widgetConfig, widgetFolderPath, widgetSassPath, widgetConfigPath,
@@ -218,7 +157,7 @@ module.exports = function( grunt ) {
                 //strip require.js module name
                 widgetFolderPath = widget.substr( 0, widget.lastIndexOf( '/' ) + 1 );
                 //replace widget require.js path shortcut with proper path relative to src/js
-                widgetSassPath = widgetFolderPath.replace( /^enketo-widget\//, '../widget/' );
+                widgetSassPath = widgetFolderPath.replace( /^enketo-widget\//, '../../widget/' );
                 //create path to widget config file
                 widgetConfigPath = widgetFolderPath.replace( /^enketo-widget\//, 'src/widget/' ) + 'config.json';
                 grunt.log.writeln( 'widget config path: ' + widgetConfigPath );
@@ -235,11 +174,10 @@ module.exports = function( grunt ) {
 
     } );
 
-    grunt.registerTask( 'compile', [ 'modernizr', 'requirejs:compile' ] );
-    grunt.registerTask( 'copytodw', [ 'copy' ] );
-    grunt.registerTask( 'test', [ 'modernizr', 'jsbeautifier:test', 'jshint', 'connect:test', 'compile', 'jasmine' ] );
+    grunt.registerTask( 'compile', [ 'requirejs:compile' ] );
+    grunt.registerTask( 'test', [ 'modernizr', 'jsbeautifier:test', 'jshint', 'compile', 'karma:headless' ] );
     grunt.registerTask( 'style', [ 'prepWidgetSass', 'sass' ] );
     grunt.registerTask( 'server', [ 'connect:server:keepalive' ] );
     grunt.registerTask( 'develop', [ 'concurrent:develop' ] );
-    grunt.registerTask( 'default', [ 'modernizr', 'jshint', 'prepWidgetSass', 'sass', 'test' ] );
+    grunt.registerTask( 'default', [ 'prepWidgetSass', 'sass', 'compile' ] );
 };

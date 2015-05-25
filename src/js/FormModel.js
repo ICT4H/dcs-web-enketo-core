@@ -2,59 +2,115 @@ if ( typeof define !== 'function' ) {
     var define = require( 'amdefine' )( module );
 }
 
-define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xpath' ], function( XPathJS, $ ) {
+define( [ 'xpath', 'enketo-js/utils', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xpath' ], function( XPathJS, utils, $ ) {
     "use strict";
 
     /**
-     * Class dealing with the XML Instance (the data) of a form
+     * Class dealing with the XML Model of a form
      *
      * @constructor
-     * @param {string} dataStr String of the default XML instance
+     * @param {string} modelStr String of the default XML instance
+     * @param {?<{id:string, xmlStr: string}> } externalData Array of external data objects
      * @param {?{full:boolean}} options.full Whether to initialize the full model or only the primary instance (for future)
      */
-
-    function FormModel( dataStr, options ) {
-        var $data,
+    function FormModel( modelStr, externalData, options ) {
+        var $model, id, instanceDoc, instanceRoot,
             that = this;
 
+        externalData = externalData || [];
+
+        this.convertedExpressions = {};
+        this.templates = {};
         this.loadErrors = [];
         this.INSTANCE = /instance\([\'|\"]([^\/:\s]+)[\'|\"]\)/g;
         this.OPENROSA = /(decimal-date-time\(|pow\(|indexed-repeat\(|format-date\(|coalesce\(|join\(|max\(|min\(|random\(|substr\(|int\(|uuid\(|regex\(|now\(|today\(|date\(|if\(|boolean-from-string\(|checklist\(|selected\(|selected-at\(|round\(|area\()/;
 
-        //TEMPORARY DUE TO FIREFOX ISSUE, REMOVE ALL NAMESPACES FROM STRING, 
-        //BETTER TO LEARN HOW TO DEAL WITH DEFAULT NAMESPACES THOUGH
-        dataStr = dataStr.replace( /xmlns\=\"[a-zA-Z0-9\:\/\.]*\"/g, '' );
+        /**
+         * Default namespaces (on a primary instance, instance child, model) would create a problem using the **native** XPath evaluator.
+         * It wouldn't find any regular /path/to/nodes. The solution is to ignore these by renaming these attributes to data-xmlns.
+         *
+         * If the regex is later deemed too aggressive, it could target the model, primary instance and primary instance child only, after creating an XML Document.
+         */
+        modelStr = modelStr.replace( /\s(xmlns\=("|')[^\s\>]+("|'))/g, ' data-$1' );
 
         // TODO: if options && !options.full, strip all secondary instances from string before parsing!
 
         try {
-            this.xml = $.parseXML( dataStr );
+            id = 'model';
+            this.xml = $.parseXML( modelStr );
+            // add external data to model
+            externalData.forEach( function( instance ) {
+                id = 'instance "' + instance.id + '"' || 'instance unknown';
+                instanceDoc = that.xml.getElementById( instance.id );
+                // remove any existing content that is just an XLSForm hack to pass ODK Validate
+                instanceRoot = instanceDoc.querySelector( 'root' );
+                if ( instanceRoot ) {
+                    instanceDoc.removeChild( instanceRoot );
+                }
+                instanceDoc.appendChild( $.parseXML( instance.xmlStr ).firstChild );
+            } );
         } catch ( e ) {
             console.error( e );
-            this.loadErrors.push( 'Error trying to parse XML model/instance.' );
+            this.loadErrors.push( 'Error trying to parse XML ' + id + '.' );
         }
 
-        $data = $( this.xml );
+        $model = $( this.xml );
 
-        this.$ = $data;
+        this.hasInstance = $model.find( 'model > instance' ).length > 0;
+
+        // check if all secondary instances with an external source have been populated
+        $model.find( 'model > instance[src]:empty' ).each( function( index, instance ) {
+            that.loadErrors.push( 'External instance "' + $( instance ).attr( 'id' ) + '" is empty.' );
+        } );
+
+        //this.instancesArray = Array.prototype.slice.call( this.xml.firstChild.children );
+        this.rootElement = this.xml.querySelector( 'instance > *' ) || this.xml.documentElement;
+        this.$ = $model;
 
         /**
          * Initializes FormModel
          */
         FormModel.prototype.init = function() {
-            var /** @type {string} */ val;
-
             // trimming values
             this.node( null, null, {
-                noEmpty: true,
-                noTemplate: false
+                noEmpty: true
             } ).get().each( function() {
-                val = $( this ).text();
-                $( this ).text( $.trim( val ) );
+                this.textContent = this.textContent.trim();
             } );
 
             this.cloneAllTemplates();
+            this.extractTemplates();
+
             return this.loadErrors;
+        };
+
+        /**
+         * Creates a custom XPath Evaluator to be used for XPath Expresssions that contain custom
+         * OpenRosa functions or for browsers that do not have a native evaluator.
+         */
+        FormModel.prototype.bindJsEvaluator = function() {
+            var evaluator = new XPathJS.XPathEvaluator();
+
+            XPathJS.bindDomLevel3XPath( this.xml, {
+                'window': {
+                    JsXPathException: true,
+                    JsXPathExpression: true,
+                    JsXPathNSResolver: true,
+                    JsXPathResult: true,
+                    JsXPathNamespace: true
+                },
+                'document': {
+                    jsCreateExpression: function() {
+                        return evaluator.createExpression.apply( evaluator, arguments );
+                    },
+                    jsCreateNSResolver: function() {
+                        return evaluator.createNSResolver.apply( evaluator, arguments );
+                    },
+                    jsEvaluate: function() {
+                        return evaluator.evaluate.apply( evaluator, arguments );
+                    }
+                }
+            } );
         };
 
         /**
@@ -63,8 +119,6 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
          * @param {(string|null)=} selector - [type/description]
          * @param {(string|number|null)=} index    - [type/description]
          * @param {(Object|null)=} filter   - [type/description]
-         * @param filter.onlyTemplate
-         * @param filter.noTemplate
          * @param filter.onlyLeaf
          * @param filter.noEmpty
          * @return {Nodeset}
@@ -77,32 +131,20 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
          * Inner Class dealing with nodes and nodesets of the XML instance
          *
          * @constructor
-         * @param {string=} selector simpleXPath or jQuery selector
+         * @param {string=} selector simpleXPath or jQuery selectedor
          * @param {number=} index    the index of the target node with that selector
-         * @param {?{onlyTemplate: boolean, noTemplate: boolean, onlyLeaf: boolean, noEmpty: boolean}=} filter   filter object for the result nodeset
+         * @param {?{onlyLeaf: boolean, noEmpty: boolean}=} filter   filter object for the result nodeset
          */
 
         function Nodeset( selector, index, filter ) {
-            var defaultSelector = '*';
+            var defaultSelector = that.hasInstance ? '/model/instance[1]//*' : '//*';
             this.originalSelector = selector;
             this.selector = ( typeof selector === 'string' && selector.length > 0 ) ? selector : defaultSelector;
             filter = ( typeof filter !== 'undefined' && filter !== null ) ? filter : {};
             this.filter = filter;
-            this.filter.noTemplate = ( typeof filter.noTemplate !== 'undefined' ) ? filter.noTemplate : true;
             this.filter.onlyLeaf = ( typeof filter.onlyLeaf !== 'undefined' ) ? filter.onlyLeaf : false;
-            this.filter.onlyTemplate = ( typeof filter.onlyTemplate !== 'undefined' ) ? filter.onlyTemplate : false;
             this.filter.noEmpty = ( typeof filter.noEmpty !== 'undefined' ) ? filter.noEmpty : false;
             this.index = index;
-
-            if ( $data.find( 'model>instance' ).length > 0 ) {
-                //to refer to non-first instance, the instance('id_literal')/path/to/node syntax can be used
-                if ( this.selector !== defaultSelector && this.selector.indexOf( '/' ) !== 0 && that.INSTANCE.test( this.selector ) ) {
-                    this.selector = this.selector.replace( that.INSTANCE, "model > instance#$1" );
-                    return;
-                }
-                //default context is the first instance in the model            
-                this.selector = "model > instance:eq(0) " + this.selector;
-            }
         }
 
         /**
@@ -113,33 +155,38 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
          * @return {jQuery} jQuery-wrapped filtered instance nodes that match the selector and index
          */
         Nodeset.prototype.get = function() {
-            var p, $nodes, /** @type {string} */ val, context;
+            var nodes, $nodes, /** @type {string} */ val;
+            // cache evaluation result
+            if ( !this.nodes ) {
+                this.nodes = that.evaluate( this.selector, 'nodes', null, null, true );
+            }
 
-            // noTemplate is ignored if onlyTemplate === true
-            if ( this.filter.onlyTemplate === true ) {
-                $nodes = $data.xfind( this.selector ).filter( '[template]' );
-            }
-            // default
-            else if ( this.filter.noTemplate === true ) {
-                $nodes = $data.xfind( this.selector ).not( '[template], [template] *' );
-            } else {
-                $nodes = $data.xfind( this.selector );
-            }
-            //noEmpty automatically excludes non-leaf nodes
+            // noEmpty automatically excludes non-leaf nodes
             if ( this.filter.noEmpty === true ) {
-                $nodes = $nodes.filter( function() {
+                $nodes = $( this.nodes ).filter( function() {
                     val = $( this ).text();
-                    return $( this ).children().length === 0 && $.trim( val ).length > 0; //$.trim($this.text()).length > 0;
+                    return $( this ).children().length === 0 && $.trim( val ).length > 0;
                 } );
             }
-            //this may still contain empty leaf nodes
+            // this may still contain empty leaf nodes
             else if ( this.filter.onlyLeaf === true ) {
-                $nodes = $nodes.filter( function() {
+                $nodes = $( this.nodes ).filter( function() {
                     return $( this ).children().length === 0;
                 } );
+            } else {
+                $nodes = $( this.nodes );
             }
-            $nodes = ( typeof this.index !== 'undefined' && this.index !== null ) ? $nodes.eq( this.index ) : $nodes;
-            return $nodes;
+
+            return ( typeof this.index !== 'undefined' && this.index !== null ) ? $nodes.eq( this.index ) : $nodes;
+        };
+
+        /**
+         * Sets the index of the Nodeset instance
+         *
+         * @param {=number?} index The 0-based index
+         */
+        Nodeset.prototype.setIndex = function( index ) {
+            this.index = index;
         };
 
         /**
@@ -171,7 +218,7 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
                 success = this.validate( expr, xmlDataType );
                 updated = this.getClosestRepeat();
                 updated.nodes = [ $target.prop( 'nodeName' ) ];
-                $data.trigger( 'dataupdate', updated );
+                $model.trigger( 'dataupdate', updated );
                 //add type="file" attribute for file references
                 if ( xmlDataType === 'binary' ) {
                     if ( newVal.length > 0 ) {
@@ -209,7 +256,13 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
             return vals;
         };
 
-        Nodeset.prototype.getIndex = function( $node ) {
+        /**
+         * Determines the index of a repeated node amongst all nodes with the same XPath selector
+         *
+         * @param  {} $node optional jquery element
+         * @return {number}       [description]
+         */
+        Nodeset.prototype.determineIndex = function( $node ) {
             var nodeName, path, $this, $family;
 
             $node = $node || this.get();
@@ -217,13 +270,12 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
             if ( $node.length === 1 ) {
                 nodeName = $node.prop( 'nodeName' );
                 path = $node.getXPath( 'instance' );
-                $family = $data.find( nodeName ).filter( function() {
-                    $this = $( this );
-                    return !$this.is( '[template]' ) && $this.find( 'template' ).length === 0 && path === $this.getXPath( 'instance' );
+                $family = $model.find( nodeName ).filter( function() {
+                    return path === $( this ).getXPath( 'instance' );
                 } );
                 return ( $family.length === 1 ) ? null : $family.index( $node );
             } else {
-                console.error( 'no node, or multiple nodes, provided to nodeset.getIndex' );
+                console.error( 'no node, or multiple nodes, provided to nodeset.determineIndex' );
                 return -1;
             }
         };
@@ -233,52 +285,15 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
             var $node = this.get(),
                 nodeName = $node.prop( 'nodeName' );
 
-            while ( $node.siblings( nodeName + ':not([template])' ).length === 0 && nodeName !== 'instance' ) {
+            while ( $node.siblings( nodeName ).length === 0 && nodeName !== 'instance' ) {
                 $node = $node.parent();
                 nodeName = $node.prop( 'nodeName' );
             }
 
             return ( nodeName === 'instance' ) ? {} : {
                 repeatPath: $node.getXPath( 'instance' ),
-                repeatIndex: this.getIndex( $node )
+                repeatIndex: this.determineIndex( $node )
             };
-        };
-
-        /**
-         * Clone repeat node after all templates have been cloned (after initialization)
-         *
-         * @param  {jQuery} $precedingTargetNode the node after which to append the clone
-         */
-        Nodeset.prototype.clone = function( $precedingTargetNode ) {
-            var $dataNode, allClonedNodeNames, $this, $clone;
-
-            $dataNode = this.get();
-            $precedingTargetNode = $precedingTargetNode || $dataNode;
-
-            if ( $dataNode.length === 1 && $precedingTargetNode.length === 1 ) {
-                $clone = $dataNode.clone();
-
-                $clone.insertAfter( $precedingTargetNode )
-                    .find( '[template]' )
-                    .addBack()
-                    .removeAttr( 'template' );
-
-                allClonedNodeNames = [ $dataNode.prop( 'nodeName' ) ];
-
-                $dataNode.find( '*' ).each( function() {
-                    $this = $( this );
-                    allClonedNodeNames.push( $this.prop( 'nodeName' ) );
-                } );
-
-                $data.trigger( 'dataupdate', {
-                    nodes: allClonedNodeNames,
-                    repeatPath: $dataNode.getXPath( 'instance' ),
-                    repeatIndex: this.getIndex( $clone )
-                } );
-
-            } else {
-                console.error( 'node.clone() function did not receive origin and target nodes' );
-            }
         };
 
         /**
@@ -299,11 +314,12 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
                 } );
 
                 repeatPath = $dataNode.getXPath( 'instance' );
-                repeatIndex = this.getIndex( $dataNode );
+                repeatIndex = this.determineIndex( $dataNode );
 
                 $dataNode.remove();
+                this.nodes = null;
 
-                $data.trigger( 'dataupdate', {
+                $model.trigger( 'dataupdate', {
                     updatedNodes: allRemovedNodeNames,
                     repeatPath: repeatPath,
                     repeatIndex: repeatIndex
@@ -338,18 +354,25 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
          * @return {boolean}
          */
         Nodeset.prototype.validate = function( expr, xmlDataType ) {
-            var typeValid, exprValid,
-                value = this.getVal()[ 0 ];
+            var typeValid, exprValid, value;
+
+            if ( !xmlDataType || typeof this.types[ xmlDataType.toLowerCase() ] == 'undefined' ) {
+                xmlDataType = 'string';
+            }
+
+            // This one weird trick results in a small validation performance increase.
+            // Do not obtain *the value* if the expr is empty and data type is string, select, select1, binary knowing that this will always return true.
+            if ( !expr && ( xmlDataType === 'string' || xmlDataType === 'select' || xmlDataType === 'select1' || xmlDataType === 'binary' ) ) {
+                return true;
+            }
+
+            value = this.getVal()[ 0 ];
 
             if ( value.toString() === '' ) {
                 return true;
             }
 
-            if ( typeof xmlDataType == 'undefined' || xmlDataType === null || typeof this.types[ xmlDataType.toLowerCase() ] == 'undefined' ) {
-                xmlDataType = 'string';
-            }
             typeValid = this.types[ xmlDataType.toLowerCase() ].validate( value );
-
             exprValid = ( typeof expr !== 'undefined' && expr !== null && expr.length > 0 ) ? that.evaluate( expr, 'boolean', this.originalSelector, this.index ) : true;
 
             return ( typeValid && exprValid );
@@ -507,59 +530,117 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
         };
     }
 
-
     /**
      * Gets the instance ID
      *
      * @return {string} instanceID
      */
     FormModel.prototype.getInstanceID = function() {
-        return this.node( ':first>meta>instanceID' ).getVal()[ 0 ];
+        return this.node( '/*/meta/instanceID' ).getVal()[ 0 ];
     };
 
+    /**
+     * Gets the instance Name
+     *
+     * @return {string} instanceID
+     */
+    FormModel.prototype.getInstanceName = function() {
+        return this.node( '/*/meta/instanceName' ).getVal()[ 0 ];
+    };
 
-    //index is the index of the node (defined in Nodeset), that the clone should be added immediately after
-    //if a node with that name and that index+1 already exists the node will NOT be cloned
-    //almost same as clone() but adds targetIndex and removes template attributes and if no template node exists it will copy a normal node
-    //nodeset (givein in node() should include filter noTemplate:false) so it will provide all nodes that that name
-    FormModel.prototype.cloneTemplate = function( selector, index ) {
-        //console.log('trying to locate data node with path: '+path+' to clone and insert after node with same xpath and index: '+index);
-        var $insertAfterNode, name,
-            template = this.node( selector, 0, {
-                onlyTemplate: true
-            } );
-        //console.log( 'cloning model template' );
-        //if form does not use jr:template="" but the node-to-clone does exist
-        template = ( template.get().length === 0 ) ? this.node( selector, 0 ) : template;
-        name = template.get().prop( 'nodeName' );
-        //console.log( 'going to find node to insert after', selector, index );
+    /**
+     * Clones a <repeat>able instance node. If a template exists it will use this, otherwise it will clone an empty version of the first node.
+     * If the node with the specified index already exists, this function will do nothing.
+     *
+     * @param  {string} selector selector of a repeat or a node that is contained inside a repeat
+     * @param  {number} index    index of the repeat that the new repeat should be inserted after.
+     */
+    FormModel.prototype.cloneRepeat = function( selector, index ) {
+        var $insertAfterNode, name, allClonedNodeNames, $templateClone,
+            $template = this.templates[ selector ] || this.node( selector, 0 ).get(),
+            that = this;
+
+        name = $template.prop( 'nodeName' );
         $insertAfterNode = this.node( selector, index ).get();
-        //console.log( 'found it', $insertAfterNode.length );
 
-        //if templatenodes and insertafternode(s) have been identified AND the node following insertafternode doesn't already exist(! important for nested repeats!)
-        if ( template.get().length === 1 && $insertAfterNode.length === 1 && $insertAfterNode.next().prop( 'nodeName' ) !== name ) { //this.node(selector, index+1).get().length === 0){
-            template.clone( $insertAfterNode );
+        // if templatenodes and insertAfterNode(s) have been identified 
+        // AND the node following insertAfterNode doesn't already exist (! important for nested repeats!)
+        if ( $template[ 0 ] && $insertAfterNode.length === 1 && $insertAfterNode.next().prop( 'nodeName' ) !== name ) {
+            $templateClone = $template.clone().insertAfter( $insertAfterNode );
+
+            allClonedNodeNames = [ $template.prop( 'nodeName' ) ];
+
+            $template.find( '*' ).each( function() {
+                allClonedNodeNames.push( $( this ).prop( 'nodeName' ) );
+            } );
+
+            that.$.trigger( 'dataupdate', {
+                nodes: allClonedNodeNames,
+                repeatPath: selector,
+                repeatIndex: that.node().determineIndex( $templateClone )
+            } );
+
         } else {
-            //console.error ('Could locate node: '+path+' with index '+index+' in data instance.There could be multiple template node (a BUG) or none.');
+            // console.error ('Could not locate node: '+path+' with index '+index+' in data instance.There could be multiple template node (a BUG) or none.');
             if ( $insertAfterNode.next().prop( 'nodeName' ) !== name ) {
                 console.error( 'Could not find template node and/or node to insert the clone after' );
             }
         }
     };
 
+
+    /**
+     * Extracts all templates from the model and stores them in a Javascript object poperties as Jquery collections
+     * @return {[type]} [description]
+     */
+    FormModel.prototype.extractTemplates = function() {
+        var that = this;
+        // in reverse document order to properly deal with nested repeat templates
+        // for now we support both the official namespaced template and the hacked non-namespaced template attributes
+        this.evaluate( '/model/instance[1]/*//*[@template] | /model/instance[1]/*//*[@jr:template]', 'nodes', null, null, true ).reverse().forEach( function( templateEl ) {
+            var $template = $( templateEl );
+            that.templates[ $template.getXPath( 'instance' ) ] = $template.removeAttr( 'template' ).removeAttr( 'jr:template' ).remove();
+        } );
+    };
+
+
+    /**
+     * Finds a template path that would contain the provided node path if that template exists in the form.
+     *
+     * @param  {string} nodePath the /path/to/template/node
+     * @return {*}               the /path/to/template
+     */
+    FormModel.prototype.getTemplatePath = function( nodePath ) {
+        var templateIndex,
+            template = null,
+            that = this;
+
+        nodePath.split( '/' ).some( function( value, index, array ) {
+            templateIndex = array.slice( 0, array.length - index ).join( '/' );
+            return that.templates[ templateIndex ];
+        } );
+
+        return templateIndex || undefined;
+    };
+
     /**
      * Initialization function that creates <repeat>able data nodes with the defaults from the template if no repeats have been created yet.
-     * Strictly speaking this is not "according to the spec" as the user should be asked first whether it has any data for this question
-     * but seems usually always better to assume at least one 'repeat' (= 1 question). It doesn't make use of the Nodeset subclass (CHANGE?)
+     * Strictly speaking creating the first repeat automatically is not "according to the spec" as the user should be asked first whether it
+     * has any data for this question.
+     * However, it seems usually always better to assume at least one 'repeat' (= 1 question). It doesn't make use of the Nodeset subclass (CHANGE?)
      *
      * See also: In JavaRosa, the documentation on the jr:template attribute.
-     *
      */
     FormModel.prototype.cloneAllTemplates = function() {
+        var that = this;
         // in reverse document order to properly deal with nested repeat templates
-        this.$.find( 'model > instance:eq(0) [template]' ).reverse().each( function() {
-            if ( $( this ).parent().closest( '[template]' ).length === 0 && $( this ).siblings( $( this ).prop( 'nodeName' ) ).not( '[template]' ).length === 0 ) {
-                $( this ).clone().insertAfter( $( this ) ).find( '*' ).addBack().removeAttr( 'template' );
+        // for now we support both the official namespaced template and the hacked non-namespaced template attributes
+        this.evaluate( '/model/instance[1]/*//*[@template] | /model/instance[1]/*//*[@jr:template]', 'nodes', null, null, true ).reverse().forEach( function( templateEl ) {
+            var nodeName = templateEl.nodeName,
+                selector = $( templateEl ).getXPath( 'instance' ),
+                ancestorTemplateNodes = that.evaluate( 'ancestor::' + nodeName + '[@template] | ancestor::' + nodeName + '[@jr:template]', 'nodes', selector, 0, true );
+            if ( ancestorTemplateNodes.length === 0 && $( templateEl ).siblings( nodeName ).length === 0 ) {
+                $( templateEl ).clone().insertAfter( $( templateEl ) ).find( '*' ).addBack().removeAttr( 'template' ).removeAttr( 'jr:template' );
             }
         } );
     };
@@ -584,35 +665,30 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
     };
 
     /**
-     * Obtains a cleaned up string of the data instance(s)
+     * Obtains a cleaned up string of the data instance
      *
-     * @param  {boolean=} incTempl indicates whether repeat templates should be included in the return value (default: false)
-     * @param  {boolean=} incNs    indicates whether namespaces should be included in return value (default: true)
-     * @param  {boolean=} all     indicates whether all instances should be included in the return value (default: false)
      * @return {string}           XML string
      */
-    FormModel.prototype.getStr = function( incTempl, incNs, all ) {
-        var $docRoot, $dataClone, dataStr;
-        dataStr = ( new XMLSerializer() ).serializeToString( this.getInstanceClone( incTempl, incNs, all )[ 0 ] );
-        //remove tabs
+    FormModel.prototype.getStr = function() {
+        var dataStr = ( new XMLSerializer() ).serializeToString( this.xml.querySelector( 'instance > *' ) || this.xml.documentElement );
+        // remove tabs
         dataStr = dataStr.replace( /\t/g, '' );
+        // restore default namespaces
+        dataStr = dataStr.replace( /\s(data-)(xmlns\=("|')[^\s\>]+("|'))/g, ' $2' );
         return dataStr;
     };
 
-    FormModel.prototype.getInstanceClone = function( incTempl, incNs, all ) {
-        var $clone = ( all ) ? this.$.find( ':first' ).clone() : this.node( '> *:first' ).get().clone();
-        return ( incTempl ) ? $clone : $clone.find( '[template]' ).remove().end();
-    };
-
     /**
-     * There is a bug in JavaRosa that has resulted in the usage of incorrect formulae on nodes inside repeat nodes.
+     * There is a huge bug in JavaRosa that has resulted in the usage of incorrect formulae on nodes inside repeat nodes.
      * Those formulae use absolute paths when relative paths should have been used. See more here:
-     * https://bitbucket.org/javarosa/javarosa/wiki/XFormDeviations (point 3).
+     * http://opendatakit.github.io/odk-xform-spec/#a-big-deviation-with-xforms
+     *
      * Tools such as pyxform also build forms in this incorrect manner. See https://github.com/modilabs/pyxform/issues/91
      * It will take time to correct this so makeBugCompliant() aims to mimic the incorrect
      * behaviour by injecting the 1-based [position] of repeats into the XPath expressions. The resulting expression
      * will then be evaluated in a way users expect (as if the paths were relative) without having to mess up
      * the XPath Evaluator.
+     *
      * E.g. '/data/rep_a/node_a' could become '/data/rep_a[2]/node_a' if the context is inside
      * the second rep_a repeat.
      *
@@ -647,6 +723,103 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
         return expr;
     };
 
+    FormModel.prototype.nsResolver = {
+
+        lookupNamespaceURI: function( prefix ) {
+            var namespaces = {
+                'jr': 'http://openrosa.org/javarosa',
+                'xsd': 'http://www.w3.org/2001/XMLSchema',
+                'orx': 'http://openrosa.org/xforms/', // CommCare uses 'http://openrosa.org/jr/xforms'
+                'cc': 'http://commcarehq.org/xforms'
+            };
+
+            return namespaces[ prefix ] || null;
+        }
+    };
+
+    /**
+     * Shift root to first instance for all absolute paths not starting with /model
+     *
+     * @param  {string} expr original expression
+     * @return {string}      new expression
+     */
+    FormModel.prototype.shiftRoot = function( expr ) {
+        if ( this.hasInstance ) {
+            expr = expr.replace( /^(\/(?!model\/)[^\/][^\/\s]*\/)/g, '/model/instance[1]$1' );
+            expr = expr.replace( /([^a-zA-Z0-9\.\]\)\/\*_-])(\/(?!model\/)[^\/][^\/\s]*\/)/g, '$1/model/instance[1]$2' );
+        }
+        return expr;
+    };
+
+    /** 
+     * Replace instance('id') with an absolute path
+     * Doing this here instead of adding an instance() function to the XPath evaluator, means we can keep using
+     * the much faster native evaluator in most cases!
+     *
+     * @param  {string} expr original expression
+     * @return {string}      new expression
+     */
+    FormModel.prototype.replaceInstanceFn = function( expr ) {
+        return expr.replace( this.INSTANCE, function( match, id ) {
+            return '/model/instance[@id="' + id + '"]';
+        } );
+    };
+
+    /** 
+     * Replaces current()/ with '' or '/' because Enketo does not (yet) change the context in an itemset.
+     * Doing this here instead of adding a current() function to the XPath evaluator, means we can keep using
+     * the much faster native evaluator in most cases!
+     *
+     * @param  {string} expr original expression
+     * @return {string}      new expression
+     */
+    FormModel.prototype.replaceCurrentFn = function( expr ) {
+        expr = expr.replace( /current\(\)\/\./g, '.' );
+        expr = expr.replace( /current\(\)/g, '' );
+        return expr;
+    };
+
+    /**
+     * Replaces indexed-repeat(node, path, position, path, position, etc) substrings by converting them
+     * to their native XPath equivalents using [position() = x] predicates
+     *
+     * @param  {string} expr the XPath expression
+     * @return {string}      converted XPath expression
+     */
+    FormModel.prototype.replaceIndexedRepeatFn = function( expr ) {
+        var indexedRepeats = utils.parseFunctionFromExpression( expr, 'indexed-repeat' );
+
+        if ( !indexedRepeats.length ) {
+            return expr;
+        }
+
+        indexedRepeats.forEach( function( indexedRepeat, irIndex ) {
+            var i, positionedPath,
+                params = indexedRepeat[ 1 ].split( ',' );
+
+            if ( params.length % 2 === 1 ) {
+
+                // trim parameters
+                params = params.map( function( param ) {
+                    return param.trim();
+                } );
+
+                positionedPath = params[ 0 ];
+
+                for ( i = params.length - 1; i > 1; i -= 2 ) {
+                    positionedPath = positionedPath.replace( params[ i - 1 ], params[ i - 1 ] + '[position() = ' + params[ i ] + ']' );
+                }
+                expr = expr.replace( indexedRepeat[ 0 ], positionedPath );
+
+            } else {
+                console.error( 'indexed repeat with incorrect number of parameters found', indexedRepeat[ 0 ] );
+                return "'Error with indexed-repeat parameters'";
+            }
+        } );
+
+        return expr;
+    };
+
     /**
      * Evaluates an XPath Expression using XPathJS_javarosa (not native XPath 1.0 evaluator)
      *
@@ -655,67 +828,57 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
      * a single node can be accessed by returned node(.textContent)
      *
      * @param  { string }     expr        the expression to evaluate
-     * @param  { string= }    resTypeStr  boolean, string, number, nodes (best to always supply this)
+     * @param  { string= }    resTypeStr  boolean, string, number, node, nodes (best to always supply this)
      * @param  { string= }    selector    jQuery selector which will be use to provide the context to the evaluator
-     * @param  { number= }    index       index of selector in document
+     * @param  { number= }    index       0-based index of selector in document
      * @param  { boolean= }   tryNative   whether an attempt to try the Native Evaluator is safe (ie. whether it is
      *                                    certain that there are no date comparisons)
      * @return { ?(number|string|boolean|Array<element>) } the result
      */
     FormModel.prototype.evaluate = function( expr, resTypeStr, selector, index, tryNative ) {
-        var i, j, error, context, $instanceDoc, instanceDoc, instances, id, resTypeNum, resultTypes, result, $result, attr,
-            $collection, $contextWrapNodes, $repParents, response, openrosa;
+        var j, error, context, doc, resTypeNum, resultTypes, result, $collection, response, repeats, cacheKey;
 
-        //console.time( 'eval in Model' );
-        //console.debug( 'evaluating expr: ' + expr + ' with context selector: ' + selector + ', 0-based index: ' +
+        // console.debug( 'evaluating expr: ' + expr + ' with context selector: ' + selector + ', 0-based index: ' +
         //    index + ' and result type: ' + resTypeStr );
         tryNative = tryNative || false;
         resTypeStr = resTypeStr || 'any';
         index = index || 0;
+        doc = this.xml;
+        repeats = null;
 
-        expr = expr.trim();
-
-        /* 
-            creating a new instanceDoc is necessary for 3 reasons:
-            - the primary instance needs to be the root (and it isn't as the root is <model> and there can be multiple <instance>s)
-            - the templates need to be removed (though this could be worked around by adding the templates as data)
-            - the hack described below with multiple instances.
-        */
-        $instanceDoc = new FormModel( this.getStr( false, false ) ).$;
-        instanceDoc = $instanceDoc[ 0 ];
-
-        /* 
-            If the expression contains the instance('id') syntax, a different context instance is required.
-            However, the same expression may also contain absolute reference to the main data instance, 
-            which means 2 different contexts would have to be supplied to the XPath Evaluator which is not
-            possible. Alternatively, the XPath Evaluator becomes able to use a default instance and direct 
-            the instance(id) references to a sibling instance context. The latter proved to be too hard for 
-            this developer, so as a workaround, the following is used instead:
-            The instance referred to in instance(id) is detached and appended to the main instance. The 
-            instance(id) syntax is subsequently converted to /node()/instance[@id=id] XPath syntax.
-        */
-
-        if ( this.INSTANCE.test( expr ) ) {
-            instances = expr.match( this.INSTANCE );
-            for ( i = 0; i < instances.length; i++ ) {
-                id = instances[ i ].match( /[\'|\"]([^\'']+)[\'|\"]/ )[ 1 ];
-                expr = expr.replace( instances[ i ], '/node()/instance[@id="' + id + '"]' );
-                this.$.find( ':first>instance#' + id ).clone().appendTo( $instanceDoc.find( ':first' ) );
-            }
+        // path corrections for repeated nodes: http://opendatakit.github.io/odk-xform-spec/#a-big-deviation-with-xforms
+        if ( selector ) {
+            $collection = this.node( selector ).get();
+            repeats = $collection.length;
+            context = $collection.eq( index )[ 0 ];
+        } else {
+            // either the first data child of the first instance or the first child (for loaded instances without a model)
+            context = this.rootElement;
         }
 
-        if ( typeof selector !== 'undefined' && selector !== null ) {
-            context = $instanceDoc.xfind( selector ).eq( index )[ 0 ];
-            /*
-             * If the context for the expression is a node that is inside a repeat.... see makeBugCompliant()
-             */
-            $collection = this.node( selector ).get();
-            if ( $collection.length > 1 ) {
-                //console.log('going to inject position into: '+expr+' for context: '+selector+' and index: '+index);
+        // cache key includes the number of repeated context nodes, 
+        // to force a new cache item if the number of repeated changes to > 0
+        // TODO: these cache keys can get quite large. Would it be beneficial to get the md5 of the key?
+        cacheKey = [ expr, selector, index, repeats ].join( '|' );
+
+        // if no cached conversion exists
+        if ( !this.convertedExpressions[ cacheKey ] ) {
+            expr = expr;
+            expr = expr.trim();
+            expr = this.shiftRoot( expr );
+            expr = this.replaceInstanceFn( expr );
+            expr = this.replaceCurrentFn( expr );
+            expr = this.replaceIndexedRepeatFn( expr );
+            if ( repeats && repeats > 1 ) {
                 expr = this.makeBugCompliant( expr, selector, index );
             }
+            // decode
+            expr = expr.replace( /&lt;/g, '<' );
+            expr = expr.replace( /&gt;/g, '>' );
+            expr = expr.replace( /&quot;/g, '"' );
+            this.convertedExpressions[ cacheKey ] = expr;
         } else {
-            context = instanceDoc;
+            expr = this.convertedExpressions[ cacheKey ];
         }
 
         resultTypes = {
@@ -724,7 +887,7 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
             2: [ 'string', 'STRING_TYPE', 'stringValue' ],
             3: [ 'boolean', 'BOOLEAN_TYPE', 'booleanValue' ],
             7: [ 'nodes', 'ORDERED_NODE_SNAPSHOT_TYPE' ],
-            9: [ 'node', 'FIRST_ORDERED_NODE_TYPE' ]
+            9: [ 'node', 'FIRST_ORDERED_NODE_TYPE', 'singleNodeValue' ]
         };
 
         // translate typeStr to number according to DOM level 3 XPath constants
@@ -732,24 +895,20 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
 
             resTypeNum = Number( resTypeNum );
 
-            if ( resultTypes[ resTypeNum ][ 0 ] == resTypeStr ) {
+            if ( resultTypes[ resTypeNum ][ 0 ] === resTypeStr ) {
                 break;
             } else {
                 resTypeNum = 0;
             }
         }
 
-        expr = expr.replace( /&lt;/g, '<' );
-        expr = expr.replace( /&gt;/g, '>' );
-        expr = expr.replace( /&quot;/g, '"' );
-
         // try native to see if that works... (will not work if the expr contains custom OpenRosa functions)
-        if ( tryNative && typeof instanceDoc.evaluate !== 'undefined' && !this.OPENROSA.test( expr ) ) {
+        if ( tryNative && typeof doc.evaluate !== 'undefined' && !this.OPENROSA.test( expr ) ) {
             try {
                 // console.log( 'trying the blazing fast native XPath Evaluator for', expr, index );
-                result = instanceDoc.evaluate( expr, context, null, resTypeNum, null );
+                result = doc.evaluate( expr, context, this.nsResolver, resTypeNum, null );
             } catch ( e ) {
-                console.log( '%cWell native XPath evaluation that did not work... No worries, worth a shot, the expression probably ' +
+                console.log( '%cWell native XPath evaluation did not work... No worries, worth a shot, the expression probably ' +
                     'contained unknown OpenRosa functions or errors:', 'color:orange', expr );
             }
         }
@@ -757,21 +916,21 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
         // if that didn't work, try the slow XPathJS evaluator 
         if ( !result ) {
             try {
-                // console.log( 'trying the super slow XPathJS_javarosa evaluator for', expr, index );
-                // bind the replacement evaluator to the instance of XMLDocument
-                XPathJS.bindDomLevel3XPath( instanceDoc );
-                result = instanceDoc.evaluate( expr, context, null, resTypeNum, null );
+                if ( typeof doc.jsEvaluate === 'undefined' ) {
+                    this.bindJsEvaluator();
+                }
+                // console.log( 'trying the slow enketo-xpathjs "openrosa" evaluator for', expr, index );
+                result = doc.jsEvaluate( expr, context, this.nsResolver, resTypeNum, null );
             } catch ( e ) {
                 error = 'Error occurred trying to evaluate: ' + expr + ', message: ' + e.message;
                 console.error( error );
                 $( document ).trigger( 'xpatherror', error );
                 this.loadErrors.push( error );
-                //console.timeEnd( 'eval in Model' );
                 return null;
             }
         }
 
-        // get desired value from result object
+        // get desired value from the result object
         if ( result ) {
             // for type = any, see if a valid string, number or boolean is returned
             if ( resTypeNum === 0 ) {
@@ -792,7 +951,6 @@ define( [ 'xpath', 'jquery', 'enketo-js/plugins', 'enketo-js/extend', 'jquery.xp
             } else {
                 response = result[ resultTypes[ resTypeNum ][ 2 ] ];
             }
-            //console.timeEnd( 'eval in Model' );
             return response;
         }
     };
