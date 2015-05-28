@@ -12,3 +12,7 @@ $radiocheck-checked-color: lighten($brand-primary-color, 10%) !default;
 $note-bg: white !default;
 $note-border: 1px solid #e1e1e1 !default;
 $note-border-radius: 0 !default;
+
+$btn-primary-color: white !default;
+$btn-primary-bg: #3498db !default;
+$btn-primary-border: darken($btn-primary-bg, 5%) !default;

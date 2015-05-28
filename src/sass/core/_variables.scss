@@ -71,7 +71,7 @@ $btn-default-bg: white !default;
 $btn-default-border: #cccccc !default;
 
 $btn-primary-color: white !default;
-$btn-primary-bg: $brand-primary-color !default;
+$btn-primary-bg: $btn-primary-color !default;
 $btn-primary-border: darken($btn-primary-bg, 5%) !default;
 
 // borders and lines

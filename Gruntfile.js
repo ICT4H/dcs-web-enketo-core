@@ -122,7 +122,7 @@ module.exports = function( grunt ) {
                         } );
                         return [ './bower-components/requirejs/require.js' ].concat( widgets );
                     } )(),
-                    out: "build/js/combined.min.js",
+                    out: "build/js/app.js",
                     optimize: "uglify2"
                 }
             }
@@ -141,8 +141,22 @@ module.exports = function( grunt ) {
                 "uglify": false,
                 "parseFiles": true
             }
+        },
+        copy: {
+            main: {
+                files: [
+                    {expand: true, flatten: true, src: ['build/js/app.js'], dest: '../datawinners/media/javascript/', filter: 'isFile'},
+                    {expand: true, flatten: true, src: ['build/css/formhub.css'], dest: '../datawinners/media/css/scss/enketo_css/', filter: 'isFile'},
+
+                    {expand: true, flatten: true, src: ['lib/bootstrap-sass/fonts/'], dest: '../datawinners/media/css/font/', filter: 'isFile'},
+                    {expand: true, flatten: true, src: ['lib/bootstrap-sass/fonts/*'], dest: '../datawinners/media/css/font/', filter: 'isFile'}
+
+                ]
+            }
         }
     } );
+
+    grunt.loadNpmTasks('grunt-contrib-copy');
 
     //maybe this can be turned into a npm module?
     grunt.registerTask( 'prepWidgetSass', 'Preparing _widgets.scss dynamically', function() {
@@ -180,4 +194,6 @@ module.exports = function( grunt ) {
     grunt.registerTask( 'server', [ 'connect:server:keepalive' ] );
     grunt.registerTask( 'develop', [ 'concurrent:develop' ] );
     grunt.registerTask( 'default', [ 'prepWidgetSass', 'sass', 'compile' ] );
+    grunt.registerTask( 'copytodw', [ 'copy' ] );
+
 };

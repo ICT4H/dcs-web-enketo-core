@@ -8,7 +8,6 @@ require.config( {
         "text": "text/text",
         "xpath": "xpath/build/enketo-xpathjs",
         "file-manager": "../src/js/file-manager",
-        "jquery": "bower-components/jquery/dist/jquery",
         "jquery.xpath": "jquery-xpath/jquery.xpath",
         "jquery.touchswipe": "jquery-touchswipe/jquery.touchSwipe",
         "leaflet": "leaflet/leaflet",
@@ -35,3 +34,13 @@ require.config( {
         }
     }
 } );
+
+define('jquery', [], function() {
+    return jQuery;
+});
+
+//Hack to not include generated bootstrap files but use the one included by datawinners htmls
+define('bootstrap', [], function() {
+    return jQuery;
+});
+
